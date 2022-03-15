@@ -1,1 +1,1 @@
-# mtb-example-pmg1-power-mode
+# mtb-example-pmg1-power-modes
