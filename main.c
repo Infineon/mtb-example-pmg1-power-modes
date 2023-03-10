@@ -7,7 +7,7 @@
 * Related Document: See README.md
 *
 *******************************************************************************
-* Copyright 2022, Cypress Semiconductor Corporation (an Infineon company) or
+* Copyright 2022-2023, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
 *
 * This software, including source code, documentation and related
@@ -38,7 +38,6 @@
 * of such system or application assumes all risk of such use and in doing
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
-    
 
 /*******************************************************************************
  * Include header files
@@ -46,7 +45,8 @@
 #include "cy_pdl.h"
 #include "cybsp.h"
 #include "cycfg_pins.h"
-
+#include "stdio.h"
+#include <inttypes.h>
 
 /******************************************************************************
  * Macros
@@ -55,43 +55,26 @@
 #define LED_OFF                 (1U)
 #define SWITCH_INTR_PRIORITY    (3U)
 
-/* Constants to define SHORT and LONG presses on User Button (x10 = ms) */
-#define SHORT_PRESS_COUNT       (20U)    /* 200ms < button pressed time < 2 sec */
-#define LONG_PRESS_COUNT        (200U)   /* button pressed time > 2 sec */
-
-/* Delays */
-#define DELAY                   (10U)
-#define UART_DELAY_MS           (25U)
+#define SLEEP_SWITCH_PRESS      (1U)
+#define DEEP_SLEEP_SWITCH_PRESS (3U)
 #define BLINK_TIME_MS           (200U)
 
-/* Switch debounce time */
+/* Debug print macro to enable UART print */
+#define DEBUG_PRINT             (0U)
 
-#define SWITCH_DEBOUNCE_TIME    (100)    /* in ms */
-
-volatile uint8_t SwitchPressFlag = 0;
-/******************************************************************************
- * Enumerated data types
- *****************************************************************************/
-typedef enum
-{
-    SWITCH_NO_EVENT     = 0U,
-    SWITCH_SHORT_PRESS  = 1U,
-    SWITCH_LONG_PRESS   = 2U,
-} en_switch_event_t;
-
+/* CY ASSERT failure */
+#define CY_ASSERT_FAILED        (0U)
 
 /*******************************************************************************
- * UART context structure
+ * Global variables
  ******************************************************************************/
-cy_stc_scb_uart_context_t CYBSP_UART_context;
-
+volatile int16_t SwitchPressCount = 0;
 
 /*******************************************************************************
  * Function Prototypes
  ******************************************************************************/
 void switch_isr();
 void led_blink(uint32_t blink_time, uint32_t num_toggles);
-en_switch_event_t get_switch_event(void);
 
 /* Sleep Callback function */
 cy_en_syspm_status_t sleep_callback(cy_stc_syspm_callback_params_t  *callbackParams,
@@ -100,15 +83,67 @@ cy_en_syspm_status_t sleep_callback(cy_stc_syspm_callback_params_t  *callbackPar
 cy_en_syspm_status_t deep_sleep_callback(cy_stc_syspm_callback_params_t *callbackParams,
                                          cy_en_syspm_callback_mode_t mode);
 
-
-/*******************************************************************************
- * Switch interrupt configuration structure
-*******************************************************************************/
-const cy_stc_sysint_t switch_intr_config = {
-        .intrSrc = CYBSP_USER_BTN_IRQ,          /* Source of interrupt signal */
-        .intrPriority = SWITCH_INTR_PRIORITY    /* Interrupt priority */
+/* SysPm callback params */
+cy_stc_syspm_callback_params_t callbackParams = {
+        /*.base       =*/ NULL,
+        /*.context    =*/ NULL
 };
 
+/* Callback declaration for Sleep mode */
+cy_stc_syspm_callback_t sleep_cb    =  {sleep_callback,              /* Callback function */
+                                       CY_SYSPM_SLEEP,               /* Callback type */
+                                       0,                            /* Skip mode */
+                                       &callbackParams,              /* Callback params */
+                                       NULL, NULL};                  /* For internal usage */
+
+/* Callback declaration for Deep Sleep mode */
+cy_stc_syspm_callback_t deep_sleep_cb = {deep_sleep_callback,        /* Callback function */
+                                       CY_SYSPM_DEEPSLEEP,           /* Callback type */
+                                       0,                            /* Skip mode */
+                                       &callbackParams,              /* Callback params */
+                                       NULL, NULL};                  /* For internal usage */
+
+/* Initialize the switch interrupt */
+cy_stc_sysint_t switch_intr_config =
+{
+    CYBSP_USER_BTN_IRQ,     /* Source of interrupt signal */
+    SWITCH_INTR_PRIORITY    /* Interrupt priority */
+};
+
+#if DEBUG_PRINT
+cy_stc_scb_uart_context_t CYBSP_UART_context;
+
+/* Variable used for tracking the print status */
+volatile bool ENTER_LOOP = true;
+
+/*******************************************************************************
+* Function Name: check_status
+********************************************************************************
+* Summary:
+*  Prints the error message.
+*
+* Parameters:
+*  error_msg - message to print if any error encountered.
+*  status - status obtained after evaluation.
+*
+* Return:
+*  void
+*
+*******************************************************************************/
+void check_status(char *message, cy_rslt_t status)
+{
+    char error_msg[50];
+
+    sprintf(error_msg, "Error Code: 0x%08" PRIX32 "\n", status);
+
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, "\r\n=====================================================\r\n");
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, "\nFAIL: ");
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, message);
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, "\r\n");
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, error_msg);
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, "\r\n=====================================================\r\n");
+}
+#endif
 
 /*******************************************************************************
  * Function Name: main
@@ -128,108 +163,104 @@ const cy_stc_sysint_t switch_intr_config = {
 int main(void)
 {
     cy_rslt_t result;
+    cy_en_sysint_status_t intr_result;
+    bool cb_result = true;
 
     /* Initialize the device and board peripherals */
     result = cybsp_init();
     if (result != CY_RSLT_SUCCESS)
     {
-        CY_ASSERT(0);
+        CY_ASSERT(CY_ASSERT_FAILED);
     }
 
     /* Enable global interrupts */
     __enable_irq();
 
+#if DEBUG_PRINT
     /* Configure and enable the UART peripheral */
     Cy_SCB_UART_Init(CYBSP_UART_HW, &CYBSP_UART_config, &CYBSP_UART_context);
     Cy_SCB_UART_Enable(CYBSP_UART_HW);
 
-    /* Send a string over serial terminal */
+    /* Sequence to clear screen */
     Cy_SCB_UART_PutString(CYBSP_UART_HW, "\x1b[2J\x1b[;H");
-    Cy_SCB_UART_PutString(CYBSP_UART_HW, "\r\n**************PMG1 MCU:Power Modes**************\r\n");
+
+    /* Print "Power modes" */
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, "****************** ");
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, "PMG1 MCU: Power modes");
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, "****************** \r\n\n");
+#endif
 
     /* Initialize and enable GPIO interrupt */
-    result = Cy_SysInt_Init(&switch_intr_config, switch_isr);
-    if(result != CY_SYSINT_SUCCESS)
+    intr_result = Cy_SysInt_Init(&switch_intr_config, switch_isr);
+    if(intr_result != CY_SYSINT_SUCCESS)
     {
-        CY_ASSERT(0);
+#if DEBUG_PRINT
+        check_status("API Cy_SysInt_Init failed with error code", intr_result);
+#endif
+        CY_ASSERT(CY_ASSERT_FAILED);
     }
-
-    /* Clear Pending Interrupt */
-    NVIC_ClearPendingIRQ(switch_intr_config.intrSrc);
 
     /* Enables interrupt in the NVIC interrupt controller */
     NVIC_EnableIRQ(switch_intr_config.intrSrc);
 
-    /* SysPm callback params */
-    cy_stc_syspm_callback_params_t callbackParams = {
-            /*.base       =*/ NULL,
-            /*.context    =*/ NULL
-    };
-
-    /* Callback declaration for Sleep mode */
-    cy_stc_syspm_callback_t sleep_cb    =  {sleep_callback,              /* Callback function */
-                                           CY_SYSPM_SLEEP,               /* Callback type */
-                                           0,                            /* Skip mode */
-                                           &callbackParams,              /* Callback params */
-                                           NULL, NULL};                  /* For internal usage */
-
-    /* Callback declaration for Deep Sleep mode */
-    cy_stc_syspm_callback_t deep_sleep_cb = {deep_sleep_callback,        /* Callback function */
-                                           CY_SYSPM_DEEPSLEEP,           /* Callback type */
-                                           0,                            /* Skip mode */
-                                           &callbackParams,              /* Callback params */
-                                           NULL, NULL};                  /* For internal usage */
-
     /* Register Sleep callback */
-    Cy_SysPm_RegisterCallback(&sleep_cb);
+    cb_result = Cy_SysPm_RegisterCallback(&sleep_cb);
+    if (cb_result != true)
+    {
+#if DEBUG_PRINT
+        check_status("API Cy_SysPm_RegisterCallback failed with error code", CY_RSLT_TYPE_ERROR);
+#endif
+        CY_ASSERT(CY_ASSERT_FAILED);
+    }
 
     /* Register Deep Sleep callback */
-    Cy_SysPm_RegisterCallback(&deep_sleep_cb);
+    cb_result = Cy_SysPm_RegisterCallback(&deep_sleep_cb);
+    if (cb_result != true)
+    {
+#if DEBUG_PRINT
+        check_status("API Cy_SysPm_RegisterCallback failed with error code", CY_RSLT_TYPE_ERROR);
+#endif
+        CY_ASSERT(CY_ASSERT_FAILED);
+    }
 
     for (;;)
     {
-        /* Turn ON LED */
-        Cy_GPIO_Write(CYBSP_USER_LED1_PORT, CYBSP_USER_LED1_NUM, LED_ON);
+        /* Turn on User LED */
+        Cy_GPIO_Write(CYBSP_USER_LED_PORT, CYBSP_USER_LED_NUM, LED_ON);
 
-        if(SwitchPressFlag == 1)
+        /* Sleep mode */
+        if(SwitchPressCount == SLEEP_SWITCH_PRESS)
         {
-            switch (get_switch_event())
-            {
-                case SWITCH_SHORT_PRESS:
+#if DEBUG_PRINT
+            /* Send a string over serial terminal */
+            Cy_SCB_UART_PutString(CYBSP_UART_HW, "Enter Sleep mode\r\n");
+#endif
+            /* Go to Sleep */
+            Cy_SysPm_CpuEnterSleep();
+       }
+       /* Deep sleep mode */
+       else if (SwitchPressCount == DEEP_SLEEP_SWITCH_PRESS)
+       {
+#if DEBUG_PRINT
+           /* Send a string over serial terminal */
+           Cy_SCB_UART_PutString(CYBSP_UART_HW, "Enter Deep Sleep mode\r\n");
+#endif
+           /* Go to Deep Sleep */
+           Cy_SysPm_CpuEnterDeepSleep();
 
-                    /* Send a string over serial terminal */
-                    Cy_SCB_UART_PutString(CYBSP_UART_HW, "Enter Sleep mode\r\n");
-                    Cy_SysLib_Delay(UART_DELAY_MS);
-
-                    /* Go to Sleep */
-                    Cy_SysPm_CpuEnterSleep();
-                    /* Wait a bit to avoid glitches in the button press */
-                    Cy_SysLib_Delay(SWITCH_DEBOUNCE_TIME);
-                    break;
-
-                case SWITCH_LONG_PRESS:
-
-                    /* Send a string over serial terminal */
-                    Cy_SCB_UART_PutString(CYBSP_UART_HW, "Enter Deep Sleep mode\r\n");
-                    Cy_SysLib_Delay(UART_DELAY_MS);
-
-                    /* Go to Deep Sleep */
-                    Cy_SysPm_CpuEnterDeepSleep();
-                    /* Wait a bit to avoid glitches in the button press */
-                    Cy_SysLib_Delay(SWITCH_DEBOUNCE_TIME);
-                    break;
-
-                default:
-                    break;
-            }
-
-            /* Revert Switch press flag 0 */
-            SwitchPressFlag = 0;
-
+           /* Making switch press count to 0U */
+           SwitchPressCount = 0;
         }
+
+#if DEBUG_PRINT
+        if (ENTER_LOOP)
+        {
+            Cy_SCB_UART_PutString(CYBSP_UART_HW, "Entered for loop\r\n");
+            ENTER_LOOP = false;
+        }
+#endif
     }
 }
-
 
 /*******************************************************************************
  * Function Name: switch_isr
@@ -237,7 +268,7 @@ int main(void)
  *
  * Summary:
  *  This function is executed when GPIO interrupt is triggered.
- *  It Clears the triggered pin interrupt and Clears Pending Interrupt.
+ *  It Clears the triggered pin interrupt
  *
  * Parameters:
  *  None
@@ -246,67 +277,72 @@ int main(void)
  *  void
  *
  ******************************************************************************/
-void switch_isr()
+void switch_isr(void)
 {
-
-    /* Set Switch press flag to 1 */
-    SwitchPressFlag = 1;
+    /* Counts the switch press */
+    SwitchPressCount++;
 
     /* Clears the triggered pin interrupt */
     Cy_GPIO_ClearInterrupt(CYBSP_USER_BTN_PORT, CYBSP_USER_BTN_NUM);
-
-    /* Clear Pending Interrupt */
-    NVIC_ClearPendingIRQ(switch_intr_config.intrSrc);
 }
-
 
 /*******************************************************************************
- * Function Name: get_switch_event
+ * Function Name: callback_function
  *******************************************************************************
- * Summary:
- *  Returns how the User button was pressed:
- *  - SWITCH_NO_EVENT: No press
- *  - SWITCH_SHORT_PRESS: Short press was detected
- *  - SWITCH_LONG_PRESS: Long press was detected
+ *
+ * Callback function implementation. It turns the LED off before going to
+ * sleep power mode / deep sleep power mode.
+ * After waking up, it sets the LED to blink for two times for sleep mode and
+ * it sets the LED to blink for three times for deep sleep mode.
  *
  * Parameters:
- *  void
+ *  mode: Sleep mode (1) / Deep sleep mode (2)
+ *  led_blink_count: Number of times User LED blinks
  *
  * Return:
- *  Switch event that occurred, if any.
+ *  void
  *
  ******************************************************************************/
-en_switch_event_t get_switch_event(void)
+cy_en_syspm_status_t callback_function(uint8_t mode, uint8_t led_blink_count)
 {
-    en_switch_event_t event = SWITCH_NO_EVENT;
-    uint32_t press_count = 0;
+    cy_en_syspm_status_t ret_val = CY_SYSPM_FAIL;
 
-    /* Check if User button is pressed */
-    while (Cy_GPIO_Read(CYBSP_USER_BTN_PORT, CYBSP_USER_BTN_NUM) == CYBSP_BTN_PRESSED)
+    switch (mode)
     {
-        /* Wait for 10 ms */
-        Cy_SysLib_Delay(DELAY);
+        case CY_SYSPM_CHECK_READY:
+            ret_val = CY_SYSPM_SUCCESS;
+            break;
 
-        /* Increment counter. Each count represents 10 ms */
-        press_count++;
+        case CY_SYSPM_CHECK_FAIL:
+#if DEBUG_PRINT
+            /* Send a string over serial terminal */
+            Cy_SCB_UART_PutString(CYBSP_UART_HW, "Device failed to enter Deep Sleep mode\r\n");
+#endif
+            ret_val = CY_SYSPM_FAIL;
+            break;
+
+        case CY_SYSPM_BEFORE_TRANSITION:
+            /* Blink the LED for two times before entering into Sleep mode */
+            led_blink(BLINK_TIME_MS, led_blink_count);
+
+            ret_val = CY_SYSPM_SUCCESS;
+            break;
+
+        case CY_SYSPM_AFTER_TRANSITION:
+#if DEBUG_PRINT
+            /* Send a string over serial terminal */
+            Cy_SCB_UART_PutString(CYBSP_UART_HW, "Enters Active mode\r\n");
+#endif
+            ret_val = CY_SYSPM_SUCCESS;
+            break;
+
+        default:
+            /* Don't do anything in the other modes */
+            ret_val = CY_SYSPM_SUCCESS;
+            break;
     }
-
-    /* Check for how long the button was pressed */
-    if (press_count > LONG_PRESS_COUNT)
-    {
-        event = SWITCH_LONG_PRESS;
-    }
-    else if (press_count > SHORT_PRESS_COUNT)
-    {
-        event = SWITCH_SHORT_PRESS;
-    }
-
-    /* Debounce the USER button */
-    Cy_SysLib_Delay(SWITCH_DEBOUNCE_TIME);
-
-    return event;
+    return ret_val;
 }
-
 
 /*******************************************************************************
  * Function Name: sleep_callback
@@ -327,60 +363,12 @@ en_switch_event_t get_switch_event(void)
 cy_en_syspm_status_t sleep_callback(
         cy_stc_syspm_callback_params_t *callbackParams, cy_en_syspm_callback_mode_t mode)
 {
-    cy_en_syspm_status_t ret_val = CY_SYSPM_FAIL;
+    cy_en_syspm_status_t retVal;
 
-    switch (mode)
-    {
-        case CY_SYSPM_CHECK_READY:
+    retVal = callback_function(mode, 2);
 
-            while(Cy_SCB_UART_IsTxComplete(CYBSP_UART_HW) == 0u)
-                {
-                    /* Wait until the TX FIFO
-                     * and Shifter are empty and there is no more data to send. */
-                }
-
-            /* Disable the UART */
-            Cy_SCB_UART_Disable(CYBSP_UART_HW, &CYBSP_UART_context);
-
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-
-        case CY_SYSPM_CHECK_FAIL:
-
-            /* Enable the UART */
-            Cy_SCB_UART_Enable(CYBSP_UART_HW);
-            /* Send a string over serial terminal */
-            Cy_SCB_UART_PutString(CYBSP_UART_HW, "Device failed to enter Sleep mode\r\n");
-
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-
-        case CY_SYSPM_BEFORE_TRANSITION:
-
-            /* Blink the LED for two times before entering into Sleep mode */
-            led_blink(BLINK_TIME_MS, 2);
-
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-
-        case CY_SYSPM_AFTER_TRANSITION:
-
-            /* Enable the UART */
-            Cy_SCB_UART_Enable(CYBSP_UART_HW);
-            /* Send a string over serial terminal */
-            Cy_SCB_UART_PutString(CYBSP_UART_HW, "Wake-up from Sleep mode and enters Active mode\r\n");
-
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-
-        default:
-            /* Don't do anything in the other modes */
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-    }
-        return ret_val;
+    return retVal;
 }
-
 
 /*******************************************************************************
  * Function Name: deep_sleep_callback
@@ -401,60 +389,12 @@ cy_en_syspm_status_t sleep_callback(
 cy_en_syspm_status_t deep_sleep_callback(
         cy_stc_syspm_callback_params_t *callbackParams, cy_en_syspm_callback_mode_t mode)
 {
-    cy_en_syspm_status_t ret_val = CY_SYSPM_FAIL;
+    cy_en_syspm_status_t retVal;
 
-    switch (mode)
-    {
-        case CY_SYSPM_CHECK_READY:
+    retVal = callback_function(mode, 3);
 
-            while(Cy_SCB_UART_IsTxComplete(CYBSP_UART_HW) == 0u)
-                {
-                    /* Wait until the TX FIFO
-                     * and Shifter are empty and there is no more data to send. */
-                }
-
-            /* Disable the UART */
-            Cy_SCB_UART_Disable(CYBSP_UART_HW, &CYBSP_UART_context);
-
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-
-        case CY_SYSPM_CHECK_FAIL:
-
-            /* Enable the UART */
-            Cy_SCB_UART_Enable(CYBSP_UART_HW);
-            /* Send a string over serial terminal */
-            Cy_SCB_UART_PutString(CYBSP_UART_HW, "Device failed to enter Deep Sleep mode\r\n");
-
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-
-        case CY_SYSPM_BEFORE_TRANSITION:
-
-            /* Blink the LED for three times before entering into Deep Sleep mode */
-            led_blink(BLINK_TIME_MS, 3);
-
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-
-        case CY_SYSPM_AFTER_TRANSITION:
-
-            /* Enable the UART */
-            Cy_SCB_UART_Enable(CYBSP_UART_HW);
-            /* Send a string over serial terminal */
-            Cy_SCB_UART_PutString(CYBSP_UART_HW, "Wake-up from Deep Sleep mode and enters Active mode\r\n");
-
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-
-        default:
-            /* Don't do anything in the other modes */
-            ret_val = CY_SYSPM_SUCCESS;
-            break;
-    }
-    return ret_val;
+    return retVal;
 }
-
 
 /*******************************************************************************
  * Function Name: led_blink
@@ -472,23 +412,21 @@ cy_en_syspm_status_t deep_sleep_callback(
  ******************************************************************************/
 void led_blink(uint32_t blink_time, uint32_t num_toggles)
 {
-    /* variable used to set LED blink time */
+    /* Variable used to set LED blink time */
     uint8_t count = 0U;
-
-    /* Turn OFF LED */
-    Cy_GPIO_Write(CYBSP_USER_LED1_PORT, CYBSP_USER_LED1_NUM, LED_OFF);
-    Cy_SysLib_Delay(blink_time);
 
     /* Toggle the LED the desired number of times in this loop */
     for (count = 0; count < num_toggles; count++)
     {
-        Cy_GPIO_Write(CYBSP_USER_LED1_PORT, CYBSP_USER_LED1_NUM, LED_ON);
+        Cy_GPIO_Write(CYBSP_USER_LED_PORT, CYBSP_USER_LED_NUM, LED_OFF);
         Cy_SysLib_Delay(blink_time);
-        Cy_GPIO_Write(CYBSP_USER_LED1_PORT, CYBSP_USER_LED1_NUM, LED_OFF);
+        Cy_GPIO_Write(CYBSP_USER_LED_PORT, CYBSP_USER_LED_NUM, LED_ON);
         Cy_SysLib_Delay(blink_time);
     }
-}
 
+    /* Turn off the User LED */
+    Cy_GPIO_Write(CYBSP_USER_LED_PORT, CYBSP_USER_LED_NUM, LED_OFF);
+}
 
 /* [] END OF FILE */
 
